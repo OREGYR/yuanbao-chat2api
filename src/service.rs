@@ -10,6 +10,7 @@ use std::str::FromStr;
 use tokio::select;
 use tracing::{debug, warn, info};
 
+// 定义聊天完成事件的枚举
 #[derive(Debug)]
 pub enum ChatCompletionEvent {
     Message(ChatCompletionMessage),
@@ -17,26 +18,31 @@ pub enum ChatCompletionEvent {
     Finish(String),
 }
 
+// 定义聊天消息的结构
 #[derive(Debug)]
 pub struct ChatCompletionMessage {
     pub r#type: ChatCompletionMessageType,
     pub text: String,
 }
 
+// 定义聊天消息类型的枚举
 #[derive(Debug)]
 pub enum ChatCompletionMessageType {
     Think,
     Msg,
 }
 
+// 定义聊天请求的结构
 pub struct ChatCompletionRequest {
     pub messages: ChatMessages,
     pub chat_model: ChatModel,
 }
 
+// 定义一组聊天消息
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatMessages(pub Vec<ChatMessage>);
 
+// 定义单个聊天消息的结构
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -44,6 +50,7 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
 }
 
+// 实现 ChatMessages 的 Display trait 用于打印消息
 impl Display for ChatMessages {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let arr = &self.0;
@@ -66,6 +73,7 @@ impl Display for ChatMessages {
     }
 }
 
+// 定义聊天模型的枚举
 #[derive(Copy, Clone)]
 pub enum ChatModel {
     DeepSeekV3,
@@ -87,6 +95,7 @@ impl FromStr for ChatModel {
 }
 
 impl ChatModel {
+    // 转换为 Yuanbao API 需要的字符串格式
     pub fn as_yuanbao_string(&self) -> String {
         match self {
             ChatModel::DeepSeekV3 => "deep_seek_v3",
@@ -94,6 +103,8 @@ impl ChatModel {
         }
         .to_string()
     }
+
+    // 转换为常见的模型字符串格式
     pub fn as_common_string(&self) -> String {
         match self {
             ChatModel::DeepSeekV3 => "deepseek-v3",
@@ -103,6 +114,18 @@ impl ChatModel {
     }
 }
 
+// 配置结构体
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    pub key: String,
+    pub agent_id: String,
+    pub hy_user: String,
+    pub hy_token: String,
+    pub port: u16,
+    pub conversation_id: String,  // 使用字符串来存储 UUID
+}
+
+// Yuanbao 结构体，用于与 API 交互
 #[derive(Clone)]
 pub struct Yuanbao {
     config: Config,
@@ -110,6 +133,7 @@ pub struct Yuanbao {
 }
 
 impl Yuanbao {
+    // 创建一个新的 Yuanbao 实例
     pub fn new(config: Config) -> Yuanbao {
         let headers = Self::make_headers(&config);
         let client = reqwest::Client::builder()
@@ -119,12 +143,13 @@ impl Yuanbao {
         Yuanbao { config, client }
     }
 
-    // 修改 create_conversation 方法，不再创建新对话，直接使用固定的 conversation_id
+    // 创建一个新的对话，返回固定的 conversation_id
     pub async fn create_conversation(&self) -> anyhow::Result<String> {
         // 使用配置文件中的固定对话 ID
         Ok(self.config.conversation_id.clone())  // 返回 UUID 字符串
     }
 
+    // 创建聊天完成请求
     pub async fn create_completion(
         &self,
         request: ChatCompletionRequest,
@@ -169,6 +194,7 @@ impl Yuanbao {
         Ok(receiver)
     }
 
+    // 处理 SSE 事件流
     async fn process_sse(
         sse: &mut EventSource,
         sender: Sender<ChatCompletionEvent>,
@@ -244,6 +270,7 @@ impl Yuanbao {
         Ok(())
     }
 
+    // 创建 HTTP 请求的头部
     fn make_headers(config: &Config) -> HeaderMap {
         HeaderMap::from_iter(vec![
             (
