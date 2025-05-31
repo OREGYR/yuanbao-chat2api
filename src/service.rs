@@ -1,7 +1,7 @@
 use anyhow::{Context, Error, bail};
 use async_channel::{Receiver, Sender, unbounded};
 use reqwest::Client;
-use reqwest::header::{HeaderMap, HeaderName};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue}; // 添加 HeaderValue 和 HeaderName
 use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -9,113 +9,10 @@ use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 use tokio::select;
 use tracing::{debug, warn, info};
+use futures::StreamExt; // 导入 StreamExt
+use serde_yaml; // 导入 serde_yaml
 
-// 定义聊天完成事件的枚举
-#[derive(Debug)]
-pub enum ChatCompletionEvent {
-    Message(ChatCompletionMessage),
-    Error(Error),
-    Finish(String),
-}
-
-// 定义聊天消息的结构
-#[derive(Debug)]
-pub struct ChatCompletionMessage {
-    pub r#type: ChatCompletionMessageType,
-    pub text: String,
-}
-
-// 定义聊天消息类型的枚举
-#[derive(Debug)]
-pub enum ChatCompletionMessageType {
-    Think,
-    Msg,
-}
-
-// 定义聊天请求的结构
-pub struct ChatCompletionRequest {
-    pub messages: ChatMessages,
-    pub chat_model: ChatModel,
-}
-
-// 定义一组聊天消息
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ChatMessages(pub Vec<ChatMessage>);
-
-// 定义单个聊天消息的结构
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: Option<String>,
-    pub reasoning_content: Option<String>,
-}
-
-// 实现 ChatMessages 的 Display trait 用于打印消息
-impl Display for ChatMessages {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let arr = &self.0;
-        if arr.is_empty() {
-            return Err(std::fmt::Error);
-        }
-        if arr.len() == 1 {
-            write!(f, "{}", arr[0].content.as_ref().unwrap_or(&"".to_string()))?;
-            return Ok(());
-        }
-        for item in arr {
-            write!(
-                f,
-                "#[{}]\n{}\n\n",
-                item.role.trim(),
-                item.content.as_ref().unwrap_or(&"".to_string()).trim()
-            )?;
-        }
-        Ok(())
-    }
-}
-
-// 定义聊天模型的枚举
-#[derive(Copy, Clone)]
-pub enum ChatModel {
-    DeepSeekV3,
-    DeepSeekR1,
-}
-
-impl FromStr for ChatModel {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "deepseek-r1" => Ok(ChatModel::DeepSeekR1),
-            "deepseek-v3" => Ok(ChatModel::DeepSeekV3),
-            &_ => {
-                bail!("invalid model")
-            }
-        }
-    }
-}
-
-impl ChatModel {
-    // 转换为 Yuanbao API 需要的字符串格式
-    pub fn as_yuanbao_string(&self) -> String {
-        match self {
-            ChatModel::DeepSeekV3 => "deep_seek_v3",
-            ChatModel::DeepSeekR1 => "deep_seek",
-        }
-        .to_string()
-    }
-
-    // 转换为常见的模型字符串格式
-    pub fn as_common_string(&self) -> String {
-        match self {
-            ChatModel::DeepSeekV3 => "deepseek-v3",
-            ChatModel::DeepSeekR1 => "deepseek-r1",
-        }
-        .to_string()
-    }
-}
-
-// 配置结构体
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)] // 添加 Clone
 pub struct Config {
     pub key: String,
     pub agent_id: String,
