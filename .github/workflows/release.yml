@@ -1,34 +1,36 @@
-# Name of the workflow
 name: Release Binaries (Multi-Target)
 
-# Trigger the workflow ONLY on pushes to tags matching the pattern 'v*'
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name for release (e.g. v1.2.3)'
+        required: true
 
-# Permissions needed by the workflow
 permissions:
-  contents: write # Required to create releases and upload assets
+  contents: write
 
-# Define the jobs to run
 jobs:
-  # Job 1: Create the GitHub Release placeholder
-  # This runs first and provides the upload URL for the build jobs
   create_release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     outputs:
-      # Output the upload URL to be used by the build jobs
       upload_url: ${{ steps.create_release.outputs.upload_url }}
       tag_name: ${{ steps.get_tag.outputs.TAG_NAME }}
     steps:
-      # Step 1.1: Get the tag name from the Git ref
       - name: Get Tag Name
         id: get_tag
-        run: echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "TAG_NAME=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
 
-      # Step 1.2: Create the actual release on GitHub
       - name: Create GitHub Release
         id: create_release
         uses: softprops/action-gh-release@v2
@@ -41,73 +43,49 @@ jobs:
             Automated multi-target release for tag ${{ steps.get_tag.outputs.TAG_NAME }}.
             Binaries attached below.
           draft: false
-          prerelease: false # Set to true if your tag indicates a pre-release
+          prerelease: false
 
-  # Job 2: Build binaries for multiple targets using a matrix strategy
   build_binaries:
     name: Build for ${{ matrix.os }} (${{ matrix.target }})
     needs: create_release
     strategy:
       matrix:
         include:
-          # ... (keep your existing matrix definitions) ...
-          # Linux x86_64 (GNU)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             name_suffix: linux-x86_64
-          # Linux ARM64 (GNU)
-#          - os: ubuntu-latest
-#            target: aarch64-unknown-linux-gnu
-#            name_suffix: linux-aarch64
-#            cross_compile_setup: |
-#              sudo dpkg --add-architecture arm64
-#              sudo apt-get update -y
-#              sudo apt-get install -y --no-install-recommends \
-#                gcc-aarch64-linux-gnu \
-#                libc6-dev-arm64-cross \
-#                libssl-dev:arm64
-#            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-          # Windows x86_64 (MSVC)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name_suffix: windows-x86_64
             binary_ext: .exe
-          # macOS x86_64 (Intel)
-          - os: macos-latest # GitHub Actions runner handles architecture
+          - os: macos-latest
             target: x86_64-apple-darwin
             name_suffix: apple-x86_64
-          # macOS ARM64 (Apple Silicon)
-          - os: macos-latest # GitHub Actions runner handles architecture
+          - os: macos-latest
             target: aarch64-apple-darwin
             name_suffix: apple-arm64
 
     runs-on: ${{ matrix.os }}
-    # --- Define BINARY_NAME at the job level ---
     env:
       BINARY_NAME: yuanbao-chat2api
 
     steps:
-      # Step 2.1: Checkout code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2.2: Set up Rust toolchain
       - name: Set up Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      # Step 2.3: Install cross-compilation tools (if needed)
       - name: Install cross-compilation tools (if necessary)
         if: matrix.cross_compile_setup != ''
         run: ${{ matrix.cross_compile_setup }}
         shell: bash
 
-      # Step 2.4: Cache Cargo dependencies
       - name: Cache Cargo registry and index
         uses: actions/cache@v4
-        # ... (cache config remains the same) ...
         with:
           path: |
             ~/.cargo/bin/
@@ -120,64 +98,45 @@ jobs:
             ${{ matrix.os }}-cargo-${{ matrix.target }}-
             ${{ matrix.os }}-cargo-
 
-      # Step 2.5: Build the project for the specific target
       - name: Build release binary (${{ matrix.target }})
-        # Use linker_env if defined, run cargo build
         run: ${{ matrix.linker_env }} cargo build --verbose --release --target ${{ matrix.target }}
         shell: bash
-        env: # Specific env vars for this step
-          # Still need PKG_CONFIG for aarch64 linux cross-compile
+        env:
           PKG_CONFIG_ALLOW_CROSS: 1
 
-      # Step 2.6: Prepare Asset Info (using job-level $BINARY_NAME)
       - name: Prepare Release Asset Info
         id: prepare_asset
-        # --- Pass matrix.binary_ext into the shell environment ---
         env:
           MATRIX_BINARY_EXT: ${{ matrix.binary_ext }}
         run: |
           echo "Job level BINARY_NAME: $BINARY_NAME"
-          echo "Step level MATRIX_BINARY_EXT: $MATRIX_BINARY_EXT" # Debugging
+          echo "Step level MATRIX_BINARY_EXT: $MATRIX_BINARY_EXT"
           TAG_NAME="${{ needs.create_release.outputs.tag_name }}"
-          # --- Use the step-level env var for the extension ---
           BIN_NAME="${BINARY_NAME}${MATRIX_BINARY_EXT}"
-          # --- Also use the step-level env var here ---
           ASSET_NAME="${BINARY_NAME}-${TAG_NAME}-${{ matrix.name_suffix }}${MATRIX_BINARY_EXT}"
-          # Check if BINARY_NAME itself is empty (belt-and-suspenders check)
+
           if [ -z "$BINARY_NAME" ]; then
-            echo "Error: Job-level BINARY_NAME variable is unexpectedly empty!"
+            echo "Error: BINARY_NAME is empty"
             exit 1
           fi
-          # Check if BIN_NAME ended up empty
+
           if [ -z "$BIN_NAME" ]; then
-            echo "Error: Calculated BIN_NAME variable is empty!"
+            echo "Error: BIN_NAME is empty"
             exit 1
           fi
-           # Check if ASSET_PATH construction would be empty (derived from BIN_NAME)
-          if [ -z "./target/${{ matrix.target }}/release/${BIN_NAME}" ]; then
-             echo "Error: Calculated ASSET_PATH would be empty!"
-             exit 1
-          fi
-          # Construct ASSET_PATH *after* validating BIN_NAME
+
           ASSET_PATH="./target/${{ matrix.target }}/release/${BIN_NAME}"
           echo "TAG_NAME=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "ASSET_PATH=${ASSET_PATH}" >> $GITHUB_OUTPUT
           echo "ASSET_NAME=${ASSET_NAME}" >> $GITHUB_OUTPUT
-          echo "--- Preparing Asset ---"
-          echo "Tag: ${TAG_NAME}"
-          echo "Binary Name: ${BIN_NAME}"
-          echo "Binary Path: ${ASSET_PATH}"
-          echo "Asset Name: ${ASSET_NAME}"
-          # Verify the constructed binary path exists
-          if [ ! -f "${ASSET_PATH}" ]; then
-             echo "Error: Binary not found at calculated path: ${ASSET_PATH}"
-             echo "Listing directory contents: ./target/${{ matrix.target }}/release/"
-             ls -lha ./target/${{ matrix.target }}/release/
-             exit 1
-          fi
-        shell: bash # Explicitly use bash for consistency
 
-      # Step 2.7: Upload the compiled binary to the release
+          if [ ! -f "${ASSET_PATH}" ]; then
+            echo "Error: Binary not found at ${ASSET_PATH}"
+            ls -lha ./target/${{ matrix.target }}/release/
+            exit 1
+          fi
+        shell: bash
+
       - name: Upload Release Asset (${{ matrix.name_suffix }})
         uses: actions/upload-release-asset@v1
         env:
@@ -187,4 +146,3 @@ jobs:
           asset_path: ${{ steps.prepare_asset.outputs.ASSET_PATH }}
           asset_name: ${{ steps.prepare_asset.outputs.ASSET_NAME }}
           asset_content_type: application/octet-stream
-
