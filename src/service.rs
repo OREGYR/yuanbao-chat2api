@@ -28,6 +28,7 @@ pub struct Config {
     pub port: u16,
     pub key: String,
     pub agent_id: String,
+    pub conversation_id: String，
     pub hy_user: String,
     pub hy_token: String,
 }
