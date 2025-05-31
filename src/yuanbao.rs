@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 static CREATE_URL: &str = "https://yuanbao.tencent.com/api/user/agent/conversation/create";
 static CLEAR_URL: &str = "https://yuanbao.tencent.com/api/user/agent/conversation/v1/clear";
-static CHAT_URL: &str = "https://yuanbao.tencent.com/api/chat/{}?chatMode=temp";
+static CHAT_URL: &str = "https://yuanbao.tencent.com/api/chat/{}";
 
 #[derive(Debug)]
 pub enum ChatCompletionEvent {
