@@ -1,194 +1,283 @@
-use crate::yuanbao::{
-    ChatCompletionEvent, ChatCompletionMessageType, ChatCompletionRequest, ChatMessage,
-    ChatMessages, ChatModel, Yuanbao,
-};
-use anyhow::{Context, bail};
-use async_channel::Receiver;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Sse;
-use axum::response::sse::Event;
-use axum::{Json, debug_handler};
-use futures::Stream;
-use futures_util::StreamExt;
-use pin_project::__private::PinnedDrop;
-use pin_project::{pin_project, pinned_drop};
+use anyhow::{Context, Error, bail};
+use async_channel::{Receiver, Sender, unbounded};
+use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderName};
+use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::pin::Pin;
+use serde_json::json;
+use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
-use std::sync::LazyLock;
-use std::task::Poll;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
+use tokio::select;
+use tracing::{debug, warn, info};
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct Config {
-    pub port: u16,
-    pub key: String,
-    pub agent_id: String,
-    pub conversation_id: String,
-    pub hy_user: String,
-    pub hy_token: String,
+#[derive(Debug)]
+pub enum ChatCompletionEvent {
+    Message(ChatCompletionMessage),
+    Error(Error),
+    Finish(String),
 }
-impl FromStr for Config {
-    type Err = anyhow::Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(serde_yaml::from_str(s)?)
+#[derive(Debug)]
+pub struct ChatCompletionMessage {
+    pub r#type: ChatCompletionMessageType,
+    pub text: String,
+}
+
+#[derive(Debug)]
+pub enum ChatCompletionMessageType {
+    Think,
+    Msg,
+}
+
+pub struct ChatCompletionRequest {
+    pub messages: ChatMessages,
+    pub chat_model: ChatModel,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatMessages(pub Vec<ChatMessage>);
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: Option<String>,
+    pub reasoning_content: Option<String>,
+}
+
+impl Display for ChatMessages {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let arr = &self.0;
+        if arr.is_empty() {
+            return Err(std::fmt::Error);
+        }
+        if arr.len() == 1 {
+            write!(f, "{}", arr[0].content.as_ref().unwrap_or(&"".to_string()))?;
+            return Ok(());
+        }
+        for item in arr {
+            write!(
+                f,
+                "#[{}]\n{}\n\n",
+                item.role.trim(),
+                item.content.as_ref().unwrap_or(&"".to_string()).trim()
+            )?;
+        }
+        Ok(())
     }
 }
-#[derive(Serialize)]
-pub struct ModelList {
-    pub object: String,
-    pub data: Vec<Model>,
+
+#[derive(Copy, Clone)]
+pub enum ChatModel {
+    DeepSeekV3,
+    DeepSeekR1,
 }
-#[derive(Serialize)]
-pub struct Model {
-    pub id: String,
-    pub object: String,
-    pub owned_by: String,
+
+impl FromStr for ChatModel {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "deepseek-r1" => Ok(ChatModel::DeepSeekR1),
+            "deepseek-v3" => Ok(ChatModel::DeepSeekV3),
+            &_ => {
+                bail!("invalid model")
+            }
+        }
+    }
 }
-#[derive(Debug, Deserialize, Serialize)]
-pub struct AxumChatCompletionRequest {
-    messages: ChatMessages,
-    model: String,
-    #[serde(default)]
-    stream: bool,
-}
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AxumChatCompletionResponse {
-    pub id: String,
-    pub choices: Vec<Choice>,
-    pub created: i64,
-    pub model: String,
-    #[serde(rename = "object")]
-    pub object_type: String,
-}
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Choice {
-    pub finish_reason: Option<String>,
-    pub index: u32,
-    pub delta: ChatMessage,
+
+impl ChatModel {
+    pub fn as_yuanbao_string(&self) -> String {
+        match self {
+            ChatModel::DeepSeekV3 => "deep_seek_v3",
+            ChatModel::DeepSeekR1 => "deep_seek",
+        }
+        .to_string()
+    }
+    pub fn as_common_string(&self) -> String {
+        match self {
+            ChatModel::DeepSeekV3 => "deepseek-v3",
+            ChatModel::DeepSeekR1 => "deepseek-r1",
+        }
+        .to_string()
+    }
 }
 
 #[derive(Clone)]
-pub struct Service {
+pub struct Yuanbao {
     config: Config,
-    yuanbao: Yuanbao,
+    client: Client,
 }
-impl Service {
-    pub fn new(config: Config) -> Service {
-        Service {
-            config: config.clone(),
-            yuanbao: Yuanbao::new(config.clone()),
-        }
+
+impl Yuanbao {
+    pub fn new(config: Config) -> Yuanbao {
+        let headers = Self::make_headers(&config);
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        Yuanbao { config, client }
     }
-    pub async fn models(&self) -> Json<ModelList> {
-        Json::from(ModelList {
-            object: "list".to_string(),
-            data: vec![
-                Model {
-                    id: "deepseek-v3".to_string(),
-                    object: "model".to_string(),
-                    owned_by: "deepseek".to_string(),
-                },
-                Model {
-                    id: "deepseek-r1".to_string(),
-                    object: "model".to_string(),
-                    owned_by: "deepseek".to_string(),
-                },
-            ],
-        })
+
+    // 修改 create_conversation 方法，不再创建新对话，直接使用固定的 conversation_id
+    pub async fn create_conversation(&self) -> anyhow::Result<String> {
+        // 使用配置文件中的固定对话 ID
+        Ok(self.config.conversation_id.clone())  // 返回 UUID 字符串
     }
-    pub async fn chat_completions(
+
+    pub async fn create_completion(
         &self,
-        key: String,
-        req: AxumChatCompletionRequest,
-    ) -> anyhow::Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>> {
-        if key != self.config.key {
-            bail!("Key is invalid");
-        }
-        let model = req.model.parse()?;
-        let receiver = self
-            .yuanbao
-            .create_completion(ChatCompletionRequest {
-                messages: req.messages,
-                chat_model: model,
-            })
+        request: ChatCompletionRequest,
+    ) -> anyhow::Result<Receiver<ChatCompletionEvent>> {
+        info!("Using fixed conversation");
+
+        // 获取固定的 conversation_id
+        let conversation_id = self
+            .create_conversation()
             .await
-            .context("cannot create completion")?;
-        let uuid = Uuid::new_v4().to_string();
-        let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        Ok(Sse::new(receiver.map(move |event| {
-            let mut message = ChatMessage {
-                content: None,
-                role: "assistant".to_string(),
-                reasoning_content: None,
-            };
-            let mut finish_reason = None;
-            match event {
-                ChatCompletionEvent::Message(msg) => match msg.r#type {
-                    ChatCompletionMessageType::Think => {
-                        message = ChatMessage {
-                            role: "assistant".to_string(),
-                            content: None,
-                            reasoning_content: Some(msg.text),
-                        }
-                    }
-                    ChatCompletionMessageType::Msg => {
-                        message = ChatMessage {
-                            role: "assistant".to_string(),
-                            content: Some(msg.text),
-                            reasoning_content: None,
-                        }
-                    }
+            .context("cannot get conversation ID")?;
+
+        info!("Using fixed conversation ID: {}", conversation_id);
+
+        let prompt = request.messages.to_string();
+        let body = json!({
+            "model": "gpt_175B_0404",
+            "prompt": prompt,
+            "plugin": "Adaptive",
+            "displayPrompt": prompt,
+            "displayPromptType": 1,
+            "options": {"imageIntention": {"needIntentionModel": true, "backendUpdateFlag": 2, "intentionStatus": true}},
+            "multimedia": [],
+            "agentId": self.config.agent_id,
+            "supportHint": 1,
+            "version": "v2",
+            "chatModelId": request.chat_model.as_yuanbao_string(),
+        });
+
+        let formatted_url = format!("https://yuanbao.tencent.com/api/chat/{}", conversation_id);
+
+        let mut sse = EventSource::new(self.client.post(&formatted_url).json(&body))
+            .context("failed to get next event")?;
+
+        let (sender, receiver) = unbounded::<ChatCompletionEvent>();
+        tokio::spawn(async move {
+            if let Err(err) = Self::process_sse(&mut sse, sender).await {
+                warn!("SSE exit: {:#}", err);
+            }
+        });
+
+        Ok(receiver)
+    }
+
+    async fn process_sse(
+        sse: &mut EventSource,
+        sender: Sender<ChatCompletionEvent>,
+    ) -> anyhow::Result<()> {
+        let mut finish_reason = "stop".to_string();
+        loop {
+            let event;
+            select! {
+                Some(e)=sse.next()=>{
+                    event=e;
                 },
-                ChatCompletionEvent::Error(err) => {
-                    finish_reason = Some(format!("{:#}", err));
-                }
-                ChatCompletionEvent::Finish(f) => {
-                    finish_reason = Some(f);
+                else => {
+                    info!("Stream ended (pattern else)");
+                    break;
                 }
             }
-            Ok(Event::default().data(
-                serde_json::to_string(&AxumChatCompletionResponse {
-                    id: uuid.to_string(),
-                    choices: vec![Choice {
-                        finish_reason,
-                        index: 0,
-                        delta: message,
-                    }],
-                    created: time,
-                    model: model.as_common_string(),
-                    object_type: "chat.completion.chunk".to_string(),
-                })
-                .unwrap(),
-            ))
-        })))
-    }
-}
-pub struct Handler {}
-impl Handler {
-    // #[debug_handler]
-    pub async fn models(service: State<Service>) -> Json<ModelList> {
-        service.models().await
-    }
-    // #[debug_handler]
-    pub async fn chat_completions(
-        service: State<Service>,
-        header_map: HeaderMap,
-        Json(req): Json<AxumChatCompletionRequest>,
-    ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
-        let mut key = header_map
-            .get("Authorization")
-            .map(|x| x.to_str().unwrap_or(""))
-            .unwrap_or("");
-        key = key.strip_prefix("Bearer ").unwrap_or(key);
-        match service.chat_completions(key.to_string(), req).await {
-            Ok(sse) => Ok(sse),
-            Err(err) => Err((StatusCode::BAD_REQUEST, format!("{:#}", err))),
+            match event {
+                Ok(Event::Open) => {}
+                Ok(Event::Message(message)) => {
+                    if message.event != "message" {
+                        continue;
+                    }
+                    let res = serde_json::from_str::<serde_json::Value>(&message.data);
+                    let value = match res {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    match value["type"].as_str().unwrap_or("") {
+                        "think" => {
+                            let content = value["content"].as_str().unwrap_or("");
+                            if content.is_empty() {
+                                continue;
+                            }
+                            sender
+                                .send(ChatCompletionEvent::Message(ChatCompletionMessage {
+                                    r#type: ChatCompletionMessageType::Think,
+                                    text: content.to_string(),
+                                }))
+                                .await?;
+                        }
+                        "text" => {
+                            let msg = value["msg"].as_str().unwrap_or("");
+                            sender
+                                .send(ChatCompletionEvent::Message(ChatCompletionMessage {
+                                    r#type: ChatCompletionMessageType::Msg,
+                                    text: msg.to_string(),
+                                }))
+                                .await?;
+                        }
+                        _ => {
+                            let stop_reason = value["stopReason"].as_str().unwrap_or("");
+                            if !stop_reason.is_empty() {
+                                finish_reason = stop_reason.to_string();
+                            }
+                        }
+                    }
+                    debug!(?message, "Event message");
+                }
+                Err(err) => match err {
+                    reqwest_eventsource::Error::StreamEnded => {
+                        info!("Stream ended");
+                        break;
+                    }
+                    _ => {
+                        return Err(anyhow!("stream error {}", err));
+                    }
+                },
+            }
         }
+        sender
+            .send(ChatCompletionEvent::Finish(finish_reason))
+            .await?;
+        Ok(())
+    }
+
+    fn make_headers(config: &Config) -> HeaderMap {
+        HeaderMap::from_iter(vec![
+            (
+                HeaderName::from_str("Cookie").unwrap(),
+                HeaderValue::from_str(&format!(
+                    "hy_source=web; hy_user={}; hy_token={}",
+                    config.hy_user, config.hy_token
+                ))
+                .unwrap(),
+            ),
+            (
+                HeaderName::from_str("Origin").unwrap(),
+                HeaderValue::from_str("https://yuanbao.tencent.com").unwrap(),
+            ),
+            (
+                HeaderName::from_str("Referer").unwrap(),
+                HeaderValue::from_str(&format!(
+                    "https://yuanbao.tencent.com/chat/{}",
+                    config.agent_id
+                ))
+                .unwrap(),
+            ),
+            (
+                HeaderName::from_str("X-Agentid").unwrap(),
+                HeaderValue::from_str(&config.agent_id).unwrap(),
+            ),
+            (
+                HeaderName::from_str("User-Agent").unwrap(),
+                HeaderValue::from_str(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)\
+                     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+                )
+                .unwrap(),
+            ),
+        ])
     }
 }
