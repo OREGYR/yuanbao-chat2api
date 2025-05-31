@@ -25,28 +25,34 @@ pub enum ChatCompletionEvent {
     Error(Error),
     Finish(String),
 }
+
 #[derive(Debug)]
 pub struct ChatCompletionMessage {
     pub r#type: ChatCompletionMessageType,
     pub text: String,
 }
+
 #[derive(Debug)]
 pub enum ChatCompletionMessageType {
     Think,
     Msg,
 }
+
 pub struct ChatCompletionRequest {
     pub messages: ChatMessages,
     pub chat_model: ChatModel,
 }
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatMessages(pub Vec<ChatMessage>);
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
 }
+
 impl Display for ChatMessages {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let arr = &self.0;
@@ -68,11 +74,13 @@ impl Display for ChatMessages {
         Ok(())
     }
 }
+
 #[derive(Copy, Clone)]
 pub enum ChatModel {
     DeepSeekV3,
     DeepSeekR1,
 }
+
 impl FromStr for ChatModel {
     type Err = Error;
 
@@ -86,6 +94,7 @@ impl FromStr for ChatModel {
         }
     }
 }
+
 impl ChatModel {
     pub fn as_yuanbao_string(&self) -> String {
         match self {
@@ -108,6 +117,7 @@ pub struct Yuanbao {
     config: Config,
     client: Client,
 }
+
 impl Yuanbao {
     pub fn new(config: Config) -> Yuanbao {
         let headers = Self::make_headers(&config);
@@ -117,65 +127,57 @@ impl Yuanbao {
             .unwrap();
         Yuanbao { config, client }
     }
+
+    // 修改 create_conversation 方法，不再创建新对话，直接使用固定的 conversation_id
     pub async fn create_conversation(&self) -> anyhow::Result<String> {
-        let res: serde_json::Value = self
-            .client
-            .post(CREATE_URL)
-            .json(&json!({"agentId":self.config.agent_id}))
-            .send()
-            .await
-            .context("cannot send request")?
-            .error_for_status()
-            .context("error status code")?
-            .json()
-            .await
-            .context("cannot parse json")?;
-        let id = res["id"].as_str().context("id not in json")?;
-        Ok(id.to_string())
+        // 使用配置文件中的固定对话 ID
+        Ok(self.config.fixed_conversation_id.clone())
     }
+
     pub async fn create_completion(
-    &self,
-    request: ChatCompletionRequest,
-) -> anyhow::Result<Receiver<ChatCompletionEvent>> {
-    use tracing::{info, warn};
-    // 使用配置中提供的固定会话 ID
-    let conversation_id = &self.config.conversation_id;
-    info!("Using fixed conversation id: {}", conversation_id);
-    // 构造请求体
-    let prompt = request.messages.to_string();
-    let body = json!({
-        "model": "gpt_175B_0404",
-        "prompt": prompt,
-        "plugin": "Adaptive",
-        "displayPrompt": prompt,
-        "displayPromptType": 1,
-        "options": {
-            "imageIntention": {
-                "needIntentionModel": true,
-                "backendUpdateFlag": 2,
-                "intentionStatus": true
+        &self,
+        request: ChatCompletionRequest,
+    ) -> anyhow::Result<Receiver<ChatCompletionEvent>> {
+        info!("Using fixed conversation");
+
+        // 获取固定的 conversation_id
+        let conversation_id = self
+            .create_conversation()
+            .await
+            .context("cannot get conversation ID")?;
+
+        info!("Using fixed conversation ID: {}", conversation_id);
+
+        let prompt = request.messages.to_string();
+        let body = json!({
+            "model": "gpt_175B_0404",
+            "prompt": prompt,
+            "plugin": "Adaptive",
+            "displayPrompt": prompt,
+            "displayPromptType": 1,
+            "options": {"imageIntention": {"needIntentionModel": true, "backendUpdateFlag": 2, "intentionStatus": true}},
+            "multimedia": [],
+            "agentId": self.config.agent_id,
+            "supportHint": 1,
+            "version": "v2",
+            "chatModelId": request.chat_model.as_yuanbao_string(),
+        });
+
+        let formatted_url = CHAT_URL.replace("{}", &conversation_id);
+
+        let mut sse = EventSource::new(self.client.post(&formatted_url).json(&body))
+            .context("failed to get next event")?;
+
+        let (sender, receiver) = unbounded::<ChatCompletionEvent>();
+        tokio::spawn(async move {
+            if let Err(err) = Self::process_sse(&mut sse, sender).await {
+                warn!("SSE exit: {:#}", err);
             }
-        },
-        "multimedia": [],
-        "agentId": self.config.agent_id,
-        "supportHint": 1,
-        "version": "v2",
-        "chatModelId": request.chat_model.as_yuanbao_string(),
-    });
-    // 替换 URL 中的占位符
-    let formatted_url = CHAT_URL.replace("{}", conversation_id);
-    // 发起 SSE 请求
-    let mut sse = EventSource::new(self.client.post(&formatted_url).json(&body))
-        .context("failed to get next event")?;
-    // 管道返回
-    let (sender, receiver) = async_channel::unbounded::<ChatCompletionEvent>();
-    tokio::spawn(async move {
-        if let Err(err) = Self::process_sse(&mut sse, sender).await {
-            warn!("SSE exit: {:#}", err);
-        }
-    });
-    Ok(receiver)
-}
+        });
+
+        Ok(receiver)
+    }
+
     async fn process_sse(
         sse: &mut EventSource,
         sender: Sender<ChatCompletionEvent>,
@@ -250,6 +252,7 @@ impl Yuanbao {
             .await?;
         Ok(())
     }
+
     fn make_headers(config: &Config) -> HeaderMap {
         HeaderMap::from_iter(vec![
             (
